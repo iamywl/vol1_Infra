@@ -1,0 +1,9 @@
+---
+- name: Prepare common OS configuration, internal DNS hosts, and time sync on all nodes
+  hosts: all
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  roles:
+    - common

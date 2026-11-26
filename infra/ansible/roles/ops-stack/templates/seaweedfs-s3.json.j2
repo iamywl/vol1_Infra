@@ -1,0 +1,20 @@
+{
+  "identities": [
+    {
+      "name": "macprod-admin",
+      "credentials": [
+        {
+          "accessKey": "{{ s3_access_key }}",
+          "secretKey": "{{ s3_secret_key }}"
+        }
+      ],
+      "actions": [
+        "Admin",
+        "Read",
+        "List",
+        "Tagging",
+        "Write"
+      ]
+    }
+  ]
+}

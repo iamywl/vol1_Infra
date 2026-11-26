@@ -1,0 +1,13 @@
+.tools/
+.DS_Store
+__pycache__/
+*.pyc
+.kube/
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+infra/ansible/inventories/hosts.ini
+infra/ansible/inventories/generated.yml
+infra/ansible/inventories/.cluster-facts.json
+.runtime/

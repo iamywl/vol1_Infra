@@ -1,0 +1,28 @@
+---
+gateway_nodeport: 30080
+
+s3_access_key: macprod-s3-admin
+s3_secret_key: macprod-s3-secret-2026
+s3_buckets:
+  - terraform-state
+  - cnpg-backups
+  - velero-backups
+  - loki-chunks
+
+gitea_admin_user: macprod
+gitea_admin_pass: MacprodGitOps2026!
+gitea_admin_email: devops@macprod.internal
+gitea_secret_key: 9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c
+gitea_internal_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.macprod
+
+internal_aliases:
+  - "api.{{ internal_domain }}"
+  - "ops.{{ internal_domain }}"
+  - "gitea.{{ internal_domain }}"
+  - "zot.{{ internal_domain }}"
+  - "s3.{{ internal_domain }}"
+  - "vault.{{ internal_domain }}"
+  - "grafana.{{ internal_domain }}"
+  - "argocd.{{ internal_domain }}"
+  - "order.{{ internal_domain }}"
+  - "hubble.{{ internal_domain }}"

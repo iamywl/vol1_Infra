@@ -1,0 +1,138 @@
+---
+- name: Install Docker engine and compose v2 on ops node
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose-v2
+      - unzip
+      - apache2-utils
+    state: present
+    update_cache: true
+
+- name: Enable and start Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Add admin user to docker group
+  ansible.builtin.user:
+    name: admin
+    groups: docker
+    append: true
+
+- name: Create /opt/macprod directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { path: /opt/macprod }
+    - { path: /opt/macprod/config }
+    - { path: /opt/macprod/scripts }
+    - { path: /opt/macprod/data/seaweedfs }
+    - { path: /opt/macprod/data/zot }
+    - { path: /opt/macprod/data/gitea }
+    - { path: /opt/macprod/data/vault, owner: "100", group: "1000" }
+    - { path: /opt/macprod/vault }
+
+- name: Render HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /opt/macprod/config/haproxy.cfg
+    mode: "0644"
+  register: haproxy_cfg
+
+- name: Render SeaweedFS S3 credentials configuration
+  ansible.builtin.template:
+    src: seaweedfs-s3.json.j2
+    dest: /opt/macprod/config/seaweedfs-s3.json
+    mode: "0644"
+
+- name: Render Zot OCI Registry configuration
+  ansible.builtin.template:
+    src: zot-config.json.j2
+    dest: /opt/macprod/config/zot-config.json
+    mode: "0644"
+
+- name: Render HashiCorp Vault HCL configuration
+  ansible.builtin.template:
+    src: vault.hcl.j2
+    dest: /opt/macprod/config/vault.hcl
+    mode: "0644"
+
+- name: Render ops-vm docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: /opt/macprod/docker-compose.yml
+    mode: "0644"
+
+- name: Render ops bootstrap & auto-unseal helper script
+  ansible.builtin.template:
+    src: bootstrap-ops.sh.j2
+    dest: /opt/macprod/scripts/bootstrap-ops.sh
+    mode: "0755"
+
+- name: Allow non-root HAProxy container to bind privileged port 80
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-macprod-ops.conf
+    mode: "0644"
+    content: |
+      net.ipv4.ip_unprivileged_port_start = 80
+
+- name: Apply ops sysctl settings
+  ansible.builtin.command: sysctl --system
+  changed_when: false
+
+- name: Start or update ops Docker Compose stack
+  ansible.builtin.command: docker compose -f /opt/macprod/docker-compose.yml up -d --remove-orphans
+  changed_when: true
+
+- name: Reload HAProxy if config changed
+  ansible.builtin.command: docker compose -f /opt/macprod/docker-compose.yml kill -s HUP haproxy
+  when: haproxy_cfg.changed
+  failed_when: false
+
+- name: Initialize Vault unseal, S3 buckets, and Gitea repos
+  ansible.builtin.command: /opt/macprod/scripts/bootstrap-ops.sh
+  changed_when: true
+
+- name: Install systemd oneshot to auto-unseal Vault on ops VM reboot
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/macprod-ops-bootstrap.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=MacProd Ops Auto-Unseal and S3/Gitea Readiness
+      After=docker.service
+      Requires=docker.service
+      StartLimitIntervalSec=120
+      StartLimitBurst=5
+
+      [Service]
+      Type=simple
+      ExecStart=/opt/macprod/scripts/bootstrap-ops.sh
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable macprod-ops-bootstrap service
+  ansible.builtin.systemd:
+    name: macprod-ops-bootstrap
+    enabled: true
+    daemon_reload: true
+
+- name: Install k6 CLI binary on ops node (bastion load generator)
+  ansible.builtin.shell: |
+    if ! command -v k6 >/dev/null 2>&1; then
+      curl -fsSL https://github.com/grafana/k6/releases/download/v2.4.0/k6-v2.4.0-linux-arm64.tar.gz -o /tmp/k6.tgz
+      tar -xzf /tmp/k6.tgz --wildcards --strip-components=1 -C /usr/local/bin '*/k6'
+      chmod +x /usr/local/bin/k6
+      rm -rf /tmp/k6.tgz
+    fi
+  args:
+    creates: /usr/local/bin/k6

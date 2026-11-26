@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: order-canary-success-rate
+  namespace: apps
+spec:
+  metrics:
+    - name: non-5xx-ratio
+      interval: 10s
+      count: 3
+      successCondition: len(result) > 0 && result[0] >= 0.90
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://kps-kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+          query: |
+            min(
+              (
+                sum by (pod) (rate(http_requests_total{namespace="apps",status!~"5.."}[45s]))
+                or
+                (0 * (sum by (pod) (rate(http_requests_total{namespace="apps"}[45s])) > 0.01))
+              )
+              /
+              (sum by (pod) (rate(http_requests_total{namespace="apps"}[45s])) > 0.01)
+            ) or vector(1)

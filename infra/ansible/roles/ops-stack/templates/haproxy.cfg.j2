@@ -1,0 +1,50 @@
+global
+  maxconn 4096
+  log stdout format raw local0
+
+defaults
+  log global
+  timeout connect 5s
+  timeout client  120s
+  timeout server  120s
+
+listen stats
+  bind *:8404
+  mode http
+  stats enable
+  stats uri /stats
+  stats refresh 5s
+
+# Kubernetes API Server L4 HA Frontend -> 3 Control Planes
+frontend k8s_api
+  bind *:{{ api_port }}
+  mode tcp
+  option tcplog
+  default_backend k8s_cp_nodes
+
+backend k8s_cp_nodes
+  mode tcp
+  balance roundrobin
+  option tcp-check
+  default-server inter 1s fall 2 rise 1
+{% for cp in control_planes %}
+  server {{ cp.name }} {{ cp.ip }}:{{ api_port }} check
+{% endfor %}
+
+# HTTP Ingress Frontend -> Cilium Gateway NodePort on 3 Workers
+frontend http_ingress
+  bind *:80
+  mode http
+  option httplog
+  default_backend k8s_gateway_workers
+
+backend k8s_gateway_workers
+  mode http
+  balance roundrobin
+  option httpchk
+  http-check send meth GET uri /healthz ver HTTP/1.1 hdr Host healthz.{{ internal_domain }}
+  http-check expect status 200,404
+  default-server inter 2s fall 2 rise 1
+{% for wk in workers %}
+  server {{ wk.name }} {{ wk.ip }}:{{ gateway_nodeport }} check
+{% endfor %}

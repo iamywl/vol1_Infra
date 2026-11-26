@@ -1,0 +1,252 @@
+---
+- name: Refresh /etc/hosts across all VMs after Mac reboot or DHCP change
+  hosts: all
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Update /etc/hosts block
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} MACPROD INTERNAL DNS"
+        block: |
+          {{ ops_ip }} {{ internal_aliases | join(' ') }}
+          {% for cp in control_planes %}
+          {{ cp.ip }} {{ cp.name }}
+          {% endfor %}
+          {% for wk in workers %}
+          {{ wk.ip }} {{ wk.name }}
+          {% endfor %}
+
+- name: Reconcile HAProxy, Vault api_addr, and unseal state on ops node
+  hosts: ops
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Re-render ops docker-compose and bootstrap helper on ops node
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: ../roles/ops-stack/templates/docker-compose.yml.j2, dest: /opt/macprod/docker-compose.yml, mode: "0644" }
+        - { src: ../roles/ops-stack/templates/bootstrap-ops.sh.j2, dest: /opt/macprod/scripts/bootstrap-ops.sh, mode: "0755" }
+
+    - name: Re-render haproxy.cfg with live backend IPs
+      ansible.builtin.template:
+        src: ../roles/ops-stack/templates/haproxy.cfg.j2
+        dest: /opt/macprod/config/haproxy.cfg
+        mode: "0644"
+      register: hap_drift
+
+    - name: Reload HAProxy if backend IPs drifted
+      ansible.builtin.command: docker compose -f /opt/macprod/docker-compose.yml restart haproxy
+      when: hap_drift.changed
+
+    - name: Re-render Vault HCL config with live ops_ip
+      ansible.builtin.template:
+        src: ../roles/ops-stack/templates/vault.hcl.j2
+        dest: /opt/macprod/config/vault.hcl
+        mode: "0644"
+      register: vault_hcl_drift
+
+    - name: Restart Vault if api_addr drifted
+      ansible.builtin.command: docker compose -f /opt/macprod/docker-compose.yml restart vault
+      when: vault_hcl_drift.changed
+
+    - name: Ensure Vault is unsealed and buckets ready
+      ansible.builtin.command: /opt/macprod/scripts/bootstrap-ops.sh
+      changed_when: false
+
+    - name: Update Vault Kubernetes auth endpoint if ops_ip drifted
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ROOT_TOKEN="$(jq -r '.root_token' /opt/macprod/vault/init.json)"
+        docker exec -e VAULT_ADDR=http://127.0.0.1:8200 -e VAULT_TOKEN="$ROOT_TOKEN" macprod-vault \
+          vault write auth/kubernetes/config kubernetes_host="https://{{ ops_ip }}:6443" >/dev/null
+      when: vault_hcl_drift.changed
+      changed_when: false
+
+- name: Reconcile Kubernetes node IPs and apiserver certs on control planes
+  hosts: control_plane
+  serial: 1
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Update kubelet --node-ip
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        mode: "0644"
+        content: |
+          KUBELET_EXTRA_ARGS=--node-ip={{ ansible_host }}
+      register: cp_kubelet_env
+
+    - name: Check if apiserver SAN matches current node and ops IPs
+      ansible.builtin.shell: |
+        openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -q "IP Address:{{ ansible_host }}" && \
+        openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -q "IP Address:{{ ops_ip }}"
+      register: san_check
+      failed_when: false
+      changed_when: false
+
+    - name: Regenerate apiserver certificate with updated SANs if IP drifted
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mv /etc/kubernetes/pki/apiserver.crt /etc/kubernetes/pki/apiserver.crt.bak
+        mv /etc/kubernetes/pki/apiserver.key /etc/kubernetes/pki/apiserver.key.bak
+        kubeadm init phase certs apiserver \
+          --apiserver-advertise-address="{{ ansible_host }}" \
+          --control-plane-endpoint="api.{{ internal_domain }}:{{ api_port }}" \
+          --service-cidr="{{ service_cidr }}" \
+          --apiserver-cert-extra-sans="api.{{ internal_domain }},ops.{{ internal_domain }},{{ ops_ip }},127.0.0.1,localhost,{{ ansible_host }}"
+        sed -i "s#--advertise-address=[0-9.]*#--advertise-address={{ ansible_host }}#" /etc/kubernetes/manifests/kube-apiserver.yaml
+        sed -i "s#--advertise-client-urls=https://[0-9.]*:2379#--advertise-client-urls=https://{{ ansible_host }}:2379#" /etc/kubernetes/manifests/etcd.yaml
+        sed -i "s#--listen-client-urls=https://127.0.0.1:2379,https://[0-9.]*:2379#--listen-client-urls=https://127.0.0.1:2379,https://{{ ansible_host }}:2379#" /etc/kubernetes/manifests/etcd.yaml
+        sed -i "s#--listen-peer-urls=https://[0-9.]*:2380#--listen-peer-urls=https://{{ ansible_host }}:2380#" /etc/kubernetes/manifests/etcd.yaml
+        sed -i "s#--initial-advertise-peer-urls=https://[0-9.]*:2380#--initial-advertise-peer-urls=https://{{ ansible_host }}:2380#" /etc/kubernetes/manifests/etcd.yaml
+      when: san_check.rc != 0
+
+    - name: Restart kubelet if node-ip or certs changed
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      when: cp_kubelet_env.changed or san_check.rc != 0
+
+- name: Reconcile worker node IPs and Zot certs.d config
+  hosts: worker
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Update worker kubelet --node-ip
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        mode: "0644"
+        content: |
+          KUBELET_EXTRA_ARGS=--node-ip={{ ansible_host }}
+      register: wk_kubelet_env
+
+    - name: Ensure Zot ops_ip certs.d exists
+      ansible.builtin.file:
+        path: "/etc/containerd/certs.d/{{ ops_ip }}:5000"
+        state: directory
+        mode: "0755"
+
+    - name: Render Zot ops_ip hosts.toml
+      ansible.builtin.template:
+        src: ../roles/k8s-node/templates/hosts.toml.j2
+        dest: "/etc/containerd/certs.d/{{ ops_ip }}:5000/hosts.toml"
+        mode: "0644"
+      vars:
+        registry_host: "{{ ops_ip }}:5000"
+
+    - name: Restart worker kubelet if IP changed
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      when: wk_kubelet_env.changed
+
+- name: Update Mac host kubeconfig endpoint after reconciliation
+  hosts: macprod-cp-1
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Fetch admin.conf
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "../../../.kube/config.raw"
+        flat: true
+
+    - name: Update .kube/config to new ops_ip
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed "s#https://api\.${INTERNAL_DOMAIN}:${API_PORT}#https://${OPS_IP}:${API_PORT}#g" \
+          ../../../.kube/config.raw > ../../../.kube/config
+        chmod 600 ../../../.kube/config
+        rm -f ../../../.kube/config.raw
+      environment:
+        INTERNAL_DOMAIN: "{{ internal_domain }}"
+        OPS_IP: "{{ ops_ip }}"
+        API_PORT: "{{ api_port }}"
+
+    - name: Wait for kube-apiserver via HAProxy /readyz
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        set -euo pipefail
+        KC="$(cd ../../.. && pwd)/.kube/config"
+        [[ "$(KUBECONFIG="$KC" kubectl get --raw=/readyz 2>/dev/null || true)" == "ok" ]]
+      register: apiserver_ready
+      retries: 36
+      delay: 5
+      until: apiserver_ready.rc == 0
+      changed_when: false
+
+    - name: Refresh CoreDNS hosts block for updated ops_ip
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        set -euo pipefail
+        KC="$(cd ../../.. && pwd)/.kube/config"
+        KUBECONFIG="$KC" kubectl -n kube-system get configmap coredns -o json > /tmp/macprod-coredns-sync.json
+        CHANGED="$(python3 - /tmp/macprod-coredns-sync.json "$OPS_IP" <<'PY'
+        import sys, json, re
+        cm = json.load(open(sys.argv[1]))
+        ops_ip = sys.argv[2]
+        orig_corefile = cm["data"]["Corefile"]
+        aliases = "api.macprod.internal ops.macprod.internal gitea.macprod.internal zot.macprod.internal s3.macprod.internal vault.macprod.internal grafana.macprod.internal argocd.macprod.internal order.macprod.internal hubble.macprod.internal"
+        block = (
+            "    # BEGIN MACPROD HOSTS\n"
+            "    hosts {\n"
+            "       " + ops_ip + " " + aliases + "\n"
+            "       fallthrough\n"
+            "    }\n"
+            "    # END MACPROD HOSTS"
+        )
+        new_corefile = re.sub(r'\s*# BEGIN MACPROD HOSTS.*?# END MACPROD HOSTS', '', orig_corefile, flags=re.S)
+        new_corefile = new_corefile.replace("    kubernetes cluster.local", block + "\n    kubernetes cluster.local", 1)
+        if new_corefile == orig_corefile:
+            print("NO")
+        else:
+            cm["data"]["Corefile"] = new_corefile
+            with open("/tmp/macprod-coredns-synced.json", "w") as out:
+                json.dump(cm, out)
+            print("YES")
+        PY
+        )"
+        if [[ "$CHANGED" == "YES" ]]; then
+          KUBECONFIG="$KC" kubectl apply -f /tmp/macprod-coredns-synced.json >/dev/null
+          KUBECONFIG="$KC" kubectl -n kube-system rollout restart deployment/coredns >/dev/null
+        fi
+      environment:
+        OPS_IP: "{{ ops_ip }}"
+
+    - name: Sync Cilium k8s-service-host if ops_ip drifted and prune dead Failed pods after nodes settle
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        set -euo pipefail
+        KC="$(cd ../../.. && pwd)/.kube/config"
+        CUR_HOST="$(KUBECONFIG="$KC" kubectl -n kube-system get configmap cilium-config -o jsonpath='{.data.k8s-service-host}' 2>/dev/null || true)"
+        if [[ -n "$CUR_HOST" && "$CUR_HOST" != "$OPS_IP" ]]; then
+          KUBECONFIG="$KC" kubectl -n kube-system patch configmap cilium-config --type merge -p "{\"data\":{\"k8s-service-host\":\"${OPS_IP}\"}}" >/dev/null
+          KUBECONFIG="$KC" kubectl -n kube-system rollout restart daemonset/cilium deployment/cilium-operator >/dev/null
+        fi
+        # Wait for all nodes to check in Ready before pruning permanently Failed (Shutdown/Evicted) pods
+        KUBECONFIG="$KC" kubectl wait --for=condition=Ready node --all --timeout=120s >/dev/null || true
+        KUBECONFIG="$KC" kubectl delete pods -A --field-selector=status.phase=Failed --ignore-not-found=true >/dev/null 2>&1 || true
+      environment:
+        OPS_IP: "{{ ops_ip }}"
+
+- name: Ensure Vault SSH CA configuration stays synced after reboot or node recovery
+  ansible.builtin.import_playbook: 05-configure-ssh-ca.yml

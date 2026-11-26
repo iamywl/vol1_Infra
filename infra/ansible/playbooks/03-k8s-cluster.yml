@@ -1,0 +1,110 @@
+---
+- name: Install containerd, kubelet, kubeadm, kubectl on all Kubernetes nodes
+  hosts: k8s
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  roles:
+    - k8s-node
+
+- name: Bootstrap primary HA control plane (macprod-cp-1)
+  hosts: macprod-cp-1
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  roles:
+    - k8s-ha-cluster
+
+- name: Join secondary control-plane nodes sequentially (etcd quorum safety)
+  hosts: control_plane:!macprod-cp-1
+  serial: 1
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Check if node already joined cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join secondary control plane
+      ansible.builtin.command: >
+        {{ hostvars['macprod-cp-1']['cp_join_base'] }}
+        --apiserver-advertise-address={{ ansible_host }}
+        --node-name={{ inventory_hostname }}
+      when: not kubelet_conf.stat.exists
+
+    - name: Ensure admin user kubeconfig exists on control-plane nodes
+      ansible.builtin.shell: |
+        mkdir -p /home/admin/.kube
+        cp /etc/kubernetes/admin.conf /home/admin/.kube/config
+        chown -R admin:admin /home/admin/.kube
+
+- name: Join worker nodes to HA cluster
+  hosts: worker
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Check if worker already joined cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: wk_kubelet_conf
+
+    - name: Join worker node
+      ansible.builtin.command: >
+        {{ hostvars['macprod-cp-1']['wk_join_base'] }}
+        --node-name={{ inventory_hostname }}
+      when: not wk_kubelet_conf.stat.exists
+
+- name: Install etcd S3 snapshot backups and export Mac host kubeconfig
+  hosts: control_plane
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  tasks:
+    - name: Render etcd-s3-backup.sh script
+      ansible.builtin.template:
+        src: ../roles/k8s-ha-cluster/templates/etcd-s3-backup.sh.j2
+        dest: /usr/local/bin/etcd-s3-backup.sh
+        mode: "0755"
+
+    - name: Schedule daily etcd S3 backup cron
+      ansible.builtin.copy:
+        dest: /etc/cron.d/etcd-s3-backup
+        mode: "0644"
+        content: |
+          15 2 * * * root /usr/local/bin/etcd-s3-backup.sh >> /var/log/etcd-s3-backup.log 2>&1
+
+    - name: Run initial etcd snapshot and upload to SeaweedFS S3 from cp-1
+      ansible.builtin.command: /usr/local/bin/etcd-s3-backup.sh
+      when: inventory_hostname == 'macprod-cp-1'
+      changed_when: true
+
+    - name: Fetch admin.conf to Mac host .kube/config
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "../../../.kube/config.raw"
+        flat: true
+      when: inventory_hostname == 'macprod-cp-1'
+
+    - name: Rewrite local host .kube/config endpoint to ops HAProxy IP
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed "s#https://api\.${INTERNAL_DOMAIN}:${API_PORT}#https://${OPS_IP}:${API_PORT}#g" \
+          ../../../.kube/config.raw > ../../../.kube/config
+        chmod 600 ../../../.kube/config
+        rm -f ../../../.kube/config.raw
+      environment:
+        INTERNAL_DOMAIN: "{{ internal_domain }}"
+        OPS_IP: "{{ ops_ip }}"
+        API_PORT: "{{ api_port }}"
+      when: inventory_hostname == 'macprod-cp-1'

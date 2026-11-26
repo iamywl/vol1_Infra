@@ -1,0 +1,78 @@
+---
+- name: Fetch Vault SSH CA public key if ssh-client-signer is configured
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../inventories/generated.yml
+  tasks:
+    - name: Query Vault SSH CA public key from macprod-ops
+      ansible.builtin.uri:
+        url: "http://{{ ops_ip }}:8200/v1/ssh-client-signer/public_key"
+        method: GET
+        return_content: true
+        status_code: [200, 403, 404]
+      register: vault_ssh_ca_resp
+
+    - name: Ensure local runtime ssh-ca directory exists
+      ansible.builtin.file:
+        path: "../../../.runtime/ssh-ca"
+        state: directory
+        mode: "0755"
+      when:
+        - vault_ssh_ca_resp.status == 200
+        - (vault_ssh_ca_resp.content | default('') | trim) is match('^ssh-')
+
+    - name: Persist Vault SSH CA public key to local runtime directory
+      ansible.builtin.copy:
+        content: "{{ vault_ssh_ca_resp.content | trim }}\n"
+        dest: "../../../.runtime/ssh-ca/trusted-user-ca-keys.pem"
+        mode: "0644"
+      when:
+        - vault_ssh_ca_resp.status == 200
+        - (vault_ssh_ca_resp.content | default('') | trim) is match('^ssh-')
+
+- name: Configure OpenSSH TrustedUserCAKeys and disable password auth on all VMs
+  hosts: all
+  become: true
+  tasks:
+    - name: Check whether Vault SSH CA public key exists locally
+      ansible.builtin.stat:
+        path: "../../../.runtime/ssh-ca/trusted-user-ca-keys.pem"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: ssh_ca_local_file
+
+    - name: Install Vault SSH CA public key onto VM
+      ansible.builtin.copy:
+        src: "../../../.runtime/ssh-ca/trusted-user-ca-keys.pem"
+        dest: /etc/ssh/trusted-user-ca-keys.pem
+        owner: root
+        group: root
+        mode: "0644"
+      when: ssh_ca_local_file.stat.exists
+      register: ssh_ca_pem
+
+    - name: Configure sshd drop-in (10- prefix overrides 50-cloud-init.conf PasswordAuthentication yes)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-macprod-ssh-ca.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (vol1_Infra Vault SSH CA)
+          # 10- prefix takes precedence over 50-cloud-init.conf under first-match-wins
+          TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+        validate: "/usr/sbin/sshd -t -f %s"
+      when: ssh_ca_local_file.stat.exists
+      register: ssh_ca_conf
+
+    - name: Reload ssh service when SSH CA config changed
+      ansible.builtin.systemd:
+        name: ssh
+        state: reloaded
+      when: ssh_ca_pem is changed or ssh_ca_conf is changed

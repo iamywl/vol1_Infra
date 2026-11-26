@@ -1,0 +1,79 @@
+---
+- name: Wait for cloud-init completion if running
+  ansible.builtin.command: cloud-init status --wait
+  changed_when: false
+  failed_when: false
+
+- name: Wait for apt/dpkg locks to clear
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 2
+    done
+  changed_when: false
+
+- name: Set VM hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Manage /etc/hosts entries for internal domain & cluster nodes
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} MACPROD INTERNAL DNS"
+    block: |
+      {{ ops_ip }} {{ internal_aliases | join(' ') }}
+      {% for cp in control_planes %}
+      {{ cp.ip }} {{ cp.name }}
+      {% endfor %}
+      {% for wk in workers %}
+      {{ wk.ip }} {{ wk.name }}
+      {% endfor %}
+
+- name: Disable swap immediately
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+
+- name: Remove swap entries from /etc/fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '\sswap\s'
+    state: absent
+
+- name: Install common operational packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - wget
+      - gnupg
+      - ca-certificates
+      - jq
+      - conntrack
+      - socat
+      - ipset
+      - chrony
+      - apt-transport-https
+      - python3-boto3
+      - python3-yaml
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure chrony time sync is active
+  ansible.builtin.systemd:
+    name: chrony
+    enabled: true
+    state: started
+
+- name: Disable unattended-upgrades and apt-daily timers on K8s/ops VMs
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    masked: true
+    state: stopped
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+    - unattended-upgrades
+  failed_when: false

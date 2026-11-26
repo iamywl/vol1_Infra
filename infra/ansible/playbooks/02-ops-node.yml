@@ -1,0 +1,9 @@
+---
+- name: Deploy external ops stack (HAProxy, SeaweedFS S3, Zot, Gitea, Vault) on macprod-ops
+  hosts: ops
+  become: true
+  vars_files:
+    - ../inventories/generated.yml
+    - ../group_vars/all.yml
+  roles:
+    - ops-stack

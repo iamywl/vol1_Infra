@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR="/var/backups/etcd"
+mkdir -p "$BACKUP_DIR"
+TS="$(date +%Y%m%d-%H%M%S)"
+SNAP_FILE="$BACKUP_DIR/etcd-$(hostname)-${TS}.db"
+
+# Use etcd static pod's etcdctl via crictl or local etcdctl if available
+if command -v etcdctl >/dev/null 2>&1; then
+  ETCDCTL_API=3 etcdctl snapshot save "$SNAP_FILE" \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key
+else
+  ETCD_CID="$(crictl ps --name '^etcd$' -q | head -n 1)"
+  crictl exec "$ETCD_CID" etcdctl snapshot save /var/lib/etcd/snapshot.db \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key
+  mv /var/lib/etcd/snapshot.db "$SNAP_FILE"
+fi
+
+# Upload snapshot to SeaweedFS S3 (off-cluster durability)
+python3 - "$SNAP_FILE" <<'PY'
+import sys, os, boto3
+from botocore.client import Config
+
+snap = sys.argv[1]
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://s3.{{ internal_domain }}:8333",
+    aws_access_key_id="{{ s3_access_key }}",
+    aws_secret_access_key="{{ s3_secret_key }}",
+    region_name="us-east-1",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+key = f"etcd-backups/{os.path.basename(snap)}"
+s3.upload_file(snap, "terraform-state", key)
+print("Uploaded snapshot to s3://terraform-state/" + key)
+PY
+
+ls -t "$BACKUP_DIR"/etcd-*.db 2>/dev/null | tail -n +6 | xargs -r rm -f
+echo "[etcd-s3-backup] Done: $SNAP_FILE"

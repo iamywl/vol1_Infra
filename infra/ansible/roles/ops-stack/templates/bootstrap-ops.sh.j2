@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export VAULT_ADDR="http://127.0.0.1:8200"
+INIT_FILE="/opt/macprod/vault/init.json"
+
+# Heal any truncated 0-byte SeaweedFS sorted index (.sdx) before ensuring containers are running
+if find /opt/macprod/data/seaweedfs -name '*.sdx' -empty 2>/dev/null | grep -q .; then
+  echo "[bootstrap-ops] Removing truncated 0-byte SeaweedFS .sdx files before startup..."
+  docker stop -t 20 macprod-seaweedfs >/dev/null 2>&1 || true
+  find /opt/macprod/data/seaweedfs -name '*.sdx' -empty -delete
+fi
+
+echo "[bootstrap-ops] Ensuring ops Docker Compose stack is up..."
+docker compose -f /opt/macprod/docker-compose.yml up -d >/dev/null
+
+echo "[bootstrap-ops] Waiting for Vault HTTP JSON health endpoint..."
+vault_ready=0
+for _ in $(seq 1 45); do
+  status_json="$(curl -s "$VAULT_ADDR/v1/sys/health" || true)"
+  if echo "$status_json" | jq -e 'has("initialized")' >/dev/null 2>&1; then
+    vault_ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$vault_ready" -ne 1 ]]; then
+  echo "[bootstrap-ops] ERROR: Vault HTTP endpoint did not return valid health JSON" >&2
+  exit 1
+fi
+
+initialized="$(echo "$status_json" | jq -r '.initialized // false')"
+
+if [[ ! -s "$INIT_FILE" && "$initialized" != "true" ]]; then
+  echo "[bootstrap-ops] Initializing Vault (1 key share)..."
+  tmp_init="$(mktemp)"
+  if docker exec -e VAULT_ADDR=http://127.0.0.1:8200 macprod-vault \
+      vault operator init -key-shares=1 -key-threshold=1 -format=json > "$tmp_init" && \
+     jq -e '.unseal_keys_b64[0] and .root_token' "$tmp_init" >/dev/null 2>&1; then
+    chmod 600 "$tmp_init"
+    mv "$tmp_init" "$INIT_FILE"
+    cp -p "$INIT_FILE" "${INIT_FILE}.bak"
+  else
+    rm -f "$tmp_init"
+    echo "[bootstrap-ops] ERROR: Vault init failed; refusing to overwrite $INIT_FILE" >&2
+    exit 1
+  fi
+fi
+
+if [[ -s "$INIT_FILE" ]]; then
+  sealed="$(curl -s "$VAULT_ADDR/v1/sys/health" | jq -r '.sealed // true')"
+  if [[ "$sealed" == "true" ]]; then
+    echo "[bootstrap-ops] Unsealing Vault..."
+    unseal_key="$(jq -r '.unseal_keys_b64[0] // empty' "$INIT_FILE")"
+    if [[ -z "$unseal_key" ]]; then
+      echo "[bootstrap-ops] ERROR: Missing unseal_key in $INIT_FILE" >&2
+      exit 1
+    fi
+    docker exec -e VAULT_ADDR=http://127.0.0.1:8200 macprod-vault \
+      vault operator unseal "$unseal_key" >/dev/null
+  fi
+fi
+
+echo "[bootstrap-ops] Waiting for SeaweedFS S3 (:8333)..."
+s3_ready=0
+for _ in $(seq 1 60); do
+  s3_code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/ || echo 000)"
+  if [[ "$s3_code" =~ ^[234] ]]; then
+    s3_ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$s3_ready" -ne 1 ]]; then
+  echo "[bootstrap-ops] ERROR: SeaweedFS S3 (:8333) did not become ready" >&2
+  exit 1
+fi
+
+echo "[bootstrap-ops] Ensuring S3 buckets exist..."
+python3 - <<'PY'
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:8333",
+    aws_access_key_id="{{ s3_access_key }}",
+    aws_secret_access_key="{{ s3_secret_key }}",
+    region_name="us-east-1",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+existing = {b["Name"] for b in s3.list_buckets().get("Buckets", [])}
+for bucket in {{ s3_buckets | to_json }}:
+    if bucket not in existing:
+        s3.create_bucket(Bucket=bucket)
+        print("Created S3 bucket:", bucket)
+    else:
+        print("S3 bucket exists:", bucket)
+PY
+
+echo "[bootstrap-ops] Waiting for Gitea (:3000)..."
+for _ in $(seq 1 40); do
+  if curl -fsS http://127.0.0.1:3000/api/v1/version >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+if ! docker exec -u git macprod-gitea gitea admin user list 2>/dev/null | awk '{print $2}' | grep -qx "{{ gitea_admin_user }}"; then
+  echo "[bootstrap-ops] Creating Gitea admin user '{{ gitea_admin_user }}'..."
+  docker exec -u git macprod-gitea gitea admin user create \
+    --admin \
+    --username "{{ gitea_admin_user }}" \
+    --password "{{ gitea_admin_pass }}" \
+    --email "{{ gitea_admin_email }}" \
+    --must-change-password=false
+fi
+
+for repo in gitops order-service; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' -u "{{ gitea_admin_user }}:{{ gitea_admin_pass }}" \
+    "http://127.0.0.1:3000/api/v1/repos/{{ gitea_admin_user }}/${repo}")"
+  if [[ "$code" == "404" ]]; then
+    echo "[bootstrap-ops] Creating Gitea repo '${repo}'..."
+    curl -fsS -X POST -u "{{ gitea_admin_user }}:{{ gitea_admin_pass }}" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"${repo}\",\"private\":false,\"auto_init\":false}" \
+      "http://127.0.0.1:3000/api/v1/user/repos" >/dev/null
+  fi
+done
+
+echo "[bootstrap-ops] Caching Argo Rollouts Gateway API plugin in SeaweedFS Filer (:8888)..."
+PLUGIN_FILE="/opt/macprod/config/gatewayapi-plugin-linux-arm64"
+if [[ ! -s "$PLUGIN_FILE" ]]; then
+  curl -fsSL "https://github.com/argoproj-labs/rollouts-plugin-trafficrouter-gatewayapi/releases/download/{{ versions.argo_rollouts_gwapi_plugin }}/gatewayapi-plugin-linux-arm64" -o "$PLUGIN_FILE"
+fi
+if ! curl -fsI "http://127.0.0.1:8888/assets/gatewayapi-plugin-linux-arm64" >/dev/null 2>&1; then
+  curl -fsS -F "file=@${PLUGIN_FILE}" "http://127.0.0.1:8888/assets/gatewayapi-plugin-linux-arm64" >/dev/null
+fi
+
+echo "[bootstrap-ops] Ops node ready."

@@ -1,0 +1,24 @@
+[ops]
+%{ for n in ops_nodes ~}
+${n.name} ansible_host=${vm_ips[n.name]}
+%{ endfor ~}
+
+[control_plane]
+%{ for n in cp_nodes ~}
+${n.name} ansible_host=${vm_ips[n.name]} bootstrap_leader=${try(n.bootstrap, false)}
+%{ endfor ~}
+
+[worker]
+%{ for n in wk_nodes ~}
+${n.name} ansible_host=${vm_ips[n.name]}
+%{ endfor ~}
+
+[k8s:children]
+control_plane
+worker
+
+[all:vars]
+ansible_user=${ssh_user}
+ansible_ssh_private_key_file=${ssh_key_path}
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10

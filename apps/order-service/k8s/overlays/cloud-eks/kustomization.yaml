@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: zot.macprod.internal:5000/apps/order-service
+    newName: 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/apps/order-service
+    newTag: v1.0.0
+patches:
+  - target:
+      kind: Rollout
+      name: order-service
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/2/value
+        value: "macprod-rds.ap-northeast-2.rds.amazonaws.com"

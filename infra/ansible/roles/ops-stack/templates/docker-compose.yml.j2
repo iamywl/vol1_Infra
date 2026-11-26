@@ -1,0 +1,72 @@
+services:
+  haproxy:
+    image: {{ versions.haproxy_image }}
+    container_name: macprod-haproxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /opt/macprod/config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  seaweedfs:
+    image: {{ versions.seaweedfs_image }}
+    container_name: macprod-seaweedfs
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: >
+      server -dir=/data -ip=127.0.0.1 -ip.bind=0.0.0.0 -master.port=9333 -volume.port=8080
+      -filer -filer.port=8888 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+      -s3.allowEmptyFolder -master.volumeSizeLimitMB=256 -volume.max=30
+    ports:
+      - "8333:8333"
+      - "8888:8888"
+      - "9333:9333"
+    volumes:
+      - /opt/macprod/data/seaweedfs:/data
+      - /opt/macprod/config/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+
+  zot:
+    image: {{ versions.zot_image }}
+    container_name: macprod-zot
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - /opt/macprod/data/zot:/var/lib/registry
+      - /opt/macprod/config/zot-config.json:/etc/zot/config.json:ro
+
+  gitea:
+    image: {{ versions.gitea_image }}
+    container_name: macprod-gitea
+    restart: unless-stopped
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__security__SECRET_KEY={{ gitea_secret_key }}
+      - GITEA__security__INTERNAL_TOKEN={{ gitea_internal_token }}
+      - GITEA__server__DOMAIN=gitea.{{ internal_domain }}
+      - GITEA__server__ROOT_URL=http://gitea.{{ internal_domain }}:3000/
+      - GITEA__server__HTTP_PORT=3000
+      - GITEA__server__SSH_PORT=2222
+      - GITEA__server__OFFLINE_MODE=true
+      - GITEA__service__DISABLE_REGISTRATION=true
+      - GITEA__actions__ENABLED=true
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    volumes:
+      - /opt/macprod/data/gitea:/data
+
+  vault:
+    image: {{ versions.vault_image }}
+    container_name: macprod-vault
+    restart: unless-stopped
+    command: ["server"]
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    volumes:
+      - /opt/macprod/data/vault:/vault/file
+      - /opt/macprod/config/vault.hcl:/vault/config/vault.hcl:ro

@@ -28,10 +28,11 @@ Apple Silicon Mac (`Apple M4 Max`, 16코어, `128 GB` RAM) 위에서 **클라우
 
 ## 2. 문서 체계
 
-1. **[00. 인프라 인수인계 & 운영 가이드](./docs/00-handover-guide.md)** — **Bottom-Up 마스터 가이드** (L0→L6 계층 해설, VM별 스펙·상주 스택·정의 파일 매핑, `make doctor -> make up`, 재부팅 복구, Vault SSH CA, 접속 치트시트)
+1. **[00. 인프라 인수인계 & 운영 가이드](./docs/00-handover-guide.md)** — **Bottom-Up 마스터 가이드** (L0→L6 계층 해설, VM별 스펙·상주 스택·정의 파일 매핑, 기술스택 역할 총람, `make doctor -> make up`, 재부팅 복구, Vault SSH CA, 접속 치트시트)
 2. **[01. 아키텍처 및 기술 스택 선정 근거 (ADR)](./docs/01-architecture-and-stack-adr.md)** — 계층별 기술 스택 선택 이유, 대안 비교(Tart, SeaweedFS, Zot, `k6`, Vault SSH CA, Kyverno CEL), AWS EKS Cloud Parity 매핑
 3. **[02. Demo 실행 가이드 (Runbook)](./docs/02-demo-runbook.md)** — `make up` 구축, **6대 실전 장애·배포·보안·복구·SSH CA 데모**, `k6` 부하, 관측성 API 조회 절차
 4. **[03. 트러블슈팅 & 버그 로그](./docs/03-troubleshooting-buglog.md)** — 구축·콜드 부팅 복구·SSH CA 검증 중 실제로 만나 해결한 **25건**의 버그·환경 제약 전수 기록
+5. **[04. 실측 검증 & 실시간 웹 UI·CLI 캡처 증빙](./docs/04-verification-evidence.md)** — `make reconcile` → `Demo 1`~`Demo 6` → `k6` 부하 → **8개 웹 UI 브라우저 실물 캡처 + 8개 CLI 실행 캡처** 전수 모음 ([docs/captures/](./docs/captures/))
 
 ---
 
@@ -69,15 +70,17 @@ make destroy        # macprod-* VM 및 로컬 런타임 상태 삭제
 
 ---
 
-## 4. 실측 검증 요약 (Apple M4 Max `128 GB` 기준)
+## 4. 실측 검증 요약 (Apple M4 Max `128 GB` 기준 · [실물 캡처 모음](./docs/04-verification-evidence.md))
 
 * **ArgoCD 애플리케이션 (`14/14` `Synced / Healthy`)**: `cert-manager`, `external-secrets`, `kyverno`, `cloudnative-pg`, `cnpg-cluster`, `velero`, `kube-prometheus-stack`, `loki`, `promtail`, `tempo`, `otel-collector`, `platform-configs`, `order-service`, `macprod-root`
-* **콜드 재부팅 복구 검증 (`make stop && make reconcile`)**: 7개 VM 순차 정지/Flush 후 재기동 시 Vault 자동 Unseal(`sealed: false`), SeaweedFS S3 무결성(`empty_sdx=0`, `HTTP 200`), `85/85` 파드 `Ready`(`non_ready=0`), `order-service` `HTTP 200`, `make demo-security`·`make demo-ssh` 통과 확인
-* **Zero-Trust SSH (`Demo 6`)**: `PasswordAuthentication no`(`10-macprod-ssh-ca.conf`) + `authorized_keys` 미등록 일회용 키 차단 후 Vault `ssh-client-signer/sign/macprod-admin` 5분 단기 인증서(`ed25519` CA)만으로 `macprod-wk-1`, `macprod-cp-1`, `macprod-ops` 로그인 성공 확인
-* **3-Master HA 내성 (`Demo 1`)**: `macprod-cp-2` 강제 정지 시 `/healthz` 40회 프로브 중 장애 감지 2초(`Non-200=2`) 외 `200 OK=38` 유지, 쓰기 쿼럼 정상, `62 MB` `etcd` 스냅샷 S3 업로드 완료
-* **PostgreSQL HA Failover (`Demo 3`)**: `order-db-1` Primary 강제 삭제 후 `order-db-2` 자동 승격 `RTO=24s`, 데이터 무손실 확인
-* **`k6` 부하 테스트 (`tests/k6/canary-load.js`)**: `30 VUs · 45s`, `3,067 req (67.95 req/s)`, 에러율 `0.00%`, `p(95)=226.5ms`
-* **관측성 파이프라인**: Prometheus(`http_requests_total`), Loki(`order-service` JSON 로그), Tempo(`order-service` OTel 분산 트레이스, `1536Mi`) API 조회 확인
+* **콜드 재부팅 복구 검증 (`make stop && make reconcile`)**: 7개 VM 순차 정지/Flush 후 재기동 시 Vault 자동 Unseal(`sealed: false`), SeaweedFS S3 무결성(`empty_sdx=0`), 전 파드 `Ready`(`non_ready=0`), `order-service` `HTTP 200` 확인
+* **Zero-Trust SSH (`Demo 6`)**: `PasswordAuthentication no` + `authorized_keys` 미등록 일회용 키 차단 후 Vault `ssh-client-signer/sign/macprod-admin` 5분 단기 인증서(`ed25519` CA)만으로 `macprod-wk-1`, `macprod-cp-1`, `macprod-ops` 로그인 성공 확인
+* **3-Master HA 내성 (`Demo 1`)**: `macprod-cp-2` 강제 정지 시 `/healthz` 40회 프로브 중 장애 감지 2초(`Non-200=2`) 외 `200 OK=38` 유지, 쓰기 쿼럼 정상, `69 MB` `etcd` 스냅샷 S3 업로드 완료
+* **카나리 자동 롤백 (`Demo 2`)**: `v2.0.0-bad` (`75%` 5xx) 푸시 → `AnalysisRun` 실패 감지 후 즉시 `RolloutAborted` + Gateway `100/0` 복귀 + Git Revert 자동 수렴
+* **PostgreSQL HA Failover (`Demo 3`)**: `order-db-1` Primary 강제 삭제 후 `order-db-2` 자동 승격 `RTO=4s`, 센티넬 레코드 무손실 & Barman S3 백업 완료
+* **Velero 재해 복구 (`Demo 5`)**: `dr-drill` 네임스페이스 + `local-path` PVC 삭제 후 SeaweedFS S3 복원(`proof='macprod-dr-verified'`) 통과
+* **`k6` 부하 테스트 (`tests/k6/canary-load.js`)**: `30 VUs · 45s`, `3,796 req (83.77 req/s)`, 에러율 `0.00%`, `p(95)=297.35ms` (`avg=196.35ms`)
+* **실시간 웹 UI 관측 검증**: HAProxy(`:8404`), ArgoCD, Grafana(`Cluster` 대시보드 CPU/Mem), Cilium Hubble(`418.5 flows/s · 6/6 nodes`), Gitea, FastAPI Swagger, SeaweedFS Filer, Vault UI 전체 실물 캡처 완료 ([04-verification-evidence.md](./docs/04-verification-evidence.md))
 
 ---
 

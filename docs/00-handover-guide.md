@@ -224,7 +224,7 @@ make demo-velero    # Demo 5: dr-drill 네임스페이스+PVC 백업 -> 삭제 -
 make demo-ssh       # Demo 6: Vault SSH CA 5분 단기 인증서 발급 & 비등록 키·패스워드 인증 차단 검증
 ```
 
-* 세부 실행 절차는 [02. Demo 실행 가이드 (Runbook)](./02-demo-runbook.md), 스택 선택 이유는 [01. 아키텍처 및 기술 스택 선정 근거 (ADR)](./01-architecture-and-stack-adr.md), 실측 해결된 `25건`의 버그는 [03. 트러블슈팅 & 버그 로그](./03-troubleshooting-buglog.md)를 참고한다.
+* 세부 실행 절차는 [02. Demo 실행 가이드 (Runbook)](./02-demo-runbook.md), 스택 선택 이유는 [01. 아키텍처 및 기술 스택 선정 근거 (ADR)](./01-architecture-and-stack-adr.md), 실측 해결된 `25건`의 버그는 [03. 트러블슈팅 & 버그 로그](./03-troubleshooting-buglog.md), 실시간 웹 UI·CLI 캡처 증빙 16종은 [04. 실측 검증 & 캡처 증빙](./04-verification-evidence.md)을 참고한다.
 
 1. **재부팅 직후 `kubectl` 연결 실패 / VM 접속 불가** → `make reconcile` 실행.
 2. **`ExternalSecret` 오류 / SSH 인증서 서명 실패** → Vault `sealed` 여부 확인 (`curl -s http://$(cat .runtime/vm-ips/macprod-ops.ip):8200/v1/sys/health | jq '{initialized, sealed}'`) 후 `make reconcile`.
